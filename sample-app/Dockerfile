@@ -6,7 +6,7 @@ COPY main.go ./
 
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o sample-app .
 
-FROM alpine:3.20
+FROM alpine:3.24
 
 WORKDIR /app
 COPY --from=builder /app/sample-app /app/sample-app
