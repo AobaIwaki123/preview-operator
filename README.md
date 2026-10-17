@@ -1,62 +1,63 @@
 # preview-operator
 
-> **Ultra-lightweight Kubernetes controller providing on-demand wakeup proxies and automated scale-to-zero for Pull Request preview environments.**
+Kubernetes上のプレビュー環境および個人開発サービス向けに、オンデマンド即時復帰プロキシとアイドル時自動スリープ（Scale to Zero）を提供する軽量コントローラー。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](go.mod)
 
-`preview-operator` solves the resource-exhaustion dilemma of ephemeral preview environments. Instead of letting idle preview pods consume valuable CPU and RAM 24/7, `preview-operator` puts them to sleep (`replicas=0`) and transparently revives them (`replicas=1`) with an instant loading screen upon incoming HTTP traffic.
+`preview-operator` は、Pull Requestプレビュー環境や低頻度アクセスの個人開発本番サービスにおける計算資源の浪費を解消します。アクセスがない待機時間はPodをスリープ（`replicas=0`）させてCPU・メモリを解放し、HTTPリクエスト受信時に自律的にPodを復帰（`replicas=1`）させ、起動完了まで待合室画面を提供した上で本来のアプリケーションへ透過プロキシします。
 
 ---
 
-## Features
+## 主な機能
 
-- ⚡ **Scale to Zero**: Automatically scales deployments to `replicas=0` after an inactivity timeout (e.g. `5m`, `30m`, `2h`).
-- 🚀 **Zero-Wait Wakeup Proxy**: Intercepts HTTP requests and serves an auto-refreshing "Waking up preview..." waiting room while scaling back up.
-- 🛡️ **Ultra-Lightweight**: Zero heavyweight dependencies. No Knative, Istio, or complex Service Meshes required. Single binary Alpine container (~15MB).
-- 🔌 **Plug & Play**: Works alongside your existing Ingress and Deployments with standard Kubernetes RBAC.
-- 🔄 **ArgoCD ApplicationSet Compatible**: Pairs seamlessly with ArgoCD Pull Request generators.
+- **Scale to Zero（自動スリープ）**: 指定した無アクセス時間（例: `5m`, `30m`, `2h`）が経過すると、対象Deploymentを自律的に `replicas=0` へスケールダウンします。
+- **待合室プロキシ（即時復帰）**: HTTPリクエストを傍受し、停止中の場合は `replicas=1` への復帰要求を発行。起動待機中は自動リロード付きの待合室画面を返却し、Ready検知後に本来のサービスへ透過転送します。
+- **軽量・低オーバーヘッド**: KnativeやIstio等の大規模なサービスメッシュやCRDボイラープレートを必要としません。Go標準ライブラリと公式 `client-go` のみで構築された単一バイナリコンテナ（Alpineベース、約15MB）で動作します。
+- **プラグアンドプレイ**: 既存のDeploymentおよびIngressのルーティング先に指定するだけで動作します。
+- **ArgoCD ApplicationSet親和性**: ArgoCDのPull Requestジェネレータと組み合わせることで、PRの作成からスリープ、PR閉鎖時の自動削除まで完全な自律ライフサイクルを実現します。
 
 ---
 
-## How It Works
+## アーキテクチャと動作の流れ
 
 ```mermaid
 %%{init: {"flowchart": {"curve": "basis"}}}%%
 flowchart LR
-    Browser["User / Reviewer"] -->|"1. HTTP Request"| Ingress["Ingress"]
-    Ingress -->|"2. Forward"| Proxy["preview-operator<br>(Wakeup Proxy)"]
+    Browser["ユーザー / レビューワー"] -->|"1. HTTPリクエスト"| Ingress["Ingress"]
+    Ingress -->|"2. トラフィック転送"| Proxy["preview-operator<br>(待合室プロキシ)"]
     
-    Proxy -->|"3. Replicas == 0?<br>Scale to 1"| K8sAPI["Kubernetes API"]
-    Proxy -.->|"4. Still starting?<br>Show Waiting Room"| Browser
+    Proxy -->|"3. Replicas == 0 の場合<br>1 へスケール要求"| K8sAPI["Kubernetes API"]
+    Proxy -.->|"4. 起動待機中<br>待合室HTML返却"| Browser
     
-    Proxy -->|"5. Ready?<br>Reverse Proxy"| AppPod["Preview Pod<br>(Deployment)"]
+    Proxy -->|"5. Ready検知後<br>リバースプロキシ"| AppPod["アプリケーション Pod<br>(Deployment)"]
     
-    Sleeper["preview-operator<br>(Idle Sleeper)"] -->|"6. Idle > 5m?<br>Scale to 0"| K8sAPI
+    Sleeper["preview-operator<br>(アイドル監視コントローラー)"] -->|"6. 一定時間アクセスなし<br>0 へスケールダウン"| K8sAPI
 ```
 
-1. **When Idle**: Deployment is scaled to `replicas=0`. Cluster resources are fully conserved.
-2. **On First Visit**: `preview-operator` intercepts traffic, issues `replicas=1` via `client-go`, and renders a responsive waiting room UI.
-3. **When Pod is Ready**: The browser automatically refreshes and traffic is transparently reverse-proxied to the backend.
-4. **On Inactivity**: A background goroutine checks the last request timestamp and scales the deployment back to `0`.
+1. **アイドル時**: Deploymentは `replicas=0` で停止しており、クラスタリソースを消費しません。
+2. **初回アクセス**: ユーザーがURLを開くと、`preview-operator` がリクエストを受け付け、`client-go` 経由で対象Deploymentを `replicas=1` へスケールアップします。
+3. **起動待機中**: ブラウザには軽量なローディング画面（待合室）が返却され、数秒おきに自動リロードされます。
+4. **起動完了**: PodがReadyになると、プロキシが本来のバックエンドサービスへ透過的にトラフィックを中継します。
+5. **無アクセス検知**: 内部タイマーが最終リクエスト時刻を監視し、無アクセス時間が閾値を超えると自動で `replicas=0` に戻します。
 
 ---
 
-## Quickstart
+## クイックスタート
 
-### 1. Configuration (Environment Variables)
+### 1. 環境変数設定
 
-| Variable | Description | Default | Required |
+| 環境変数 | 説明 | デフォルト値 | 必須 |
 |---|---|---|---|
-| `TARGET_SERVICE_URL` | Upstream backend URL to reverse proxy to (e.g. `http://my-app:80`) | - | Yes |
-| `DEPLOYMENT_NAME` | Target Kubernetes Deployment name to scale | - | Yes |
-| `NAMESPACE` | Target Kubernetes Namespace | `default` | No |
-| `IDLE_TIMEOUT` | Idle duration before sleeping (e.g. `5m`, `30m`, `2h`) | `2h` | No |
-| `PORT` | Listening port for the operator proxy | `8080` | No |
+| `TARGET_SERVICE_URL` | プロキシ先の上流サービスURL（例: `http://my-app:80`） | - | 必須 |
+| `DEPLOYMENT_NAME` | スケール操作の対象となるKubernetes Deployment名 | - | 必須 |
+| `NAMESPACE` | 対象リソースが存在するKubernetes Namespace | `default` | 任意 |
+| `IDLE_TIMEOUT` | スリープまでの無アクセス待機時間（例: `5m`, `30m`, `2h`） | `2h` | 任意 |
+| `PORT` | オペレータープロキシのリスニングポート | `8080` | 任意 |
 
-### 2. Kubernetes Deployment Example
+### 2. デプロイ例 (Deployment & Service)
 
-Deploy `preview-operator` in the target namespace and route your Ingress to `service/preview-operator:8080`:
+対象アプリケーションと同じNamespaceに `preview-operator` をデプロイし、Ingressの宛先サービスを本オペレーター（ポート8080）に向けます。
 
 ```yaml
 apiVersion: apps/v1
@@ -107,9 +108,9 @@ spec:
     app: preview-operator
 ```
 
-### 3. Required RBAC
+### 3. 必要なRBAC設定
 
-The operator requires permission to `get` and `update` (patch) `scale` subresources on the target Deployment:
+本オペレーターは、対象Deploymentのスケール情報取得および更新（Patch）を行うための権限が必要です。
 
 ```yaml
 apiVersion: v1
@@ -144,14 +145,27 @@ roleRef:
 
 ---
 
-## Documentation
+## 設計思想と将来のロードマップ
 
-- [Architecture & Controller Best Practices](docs/architecture-and-best-practices.md): Deep dive into modular design, Clean Architecture, and Kubernetes SIGs best practices.
-- [ArgoCD ApplicationSet Integration](docs/argocd-integration.md): Step-by-step recipe for automated PR lifecycle management.
-- [Concept & Motivation](docs/concept.md): Why we built this, and how it compares to traditional CI setups.
+### 設計思想
+本プロジェクトは、CRDの肥大化や重量級フレームワーク（Kubebuilder等）の導入をあえて避け、`client-go` の基本APIを用いた「最小限のGo実装による信頼性の担保」を原則としています。
+
+### 将来の拡張計画 (Roadmap)
+- **Self-Healing Rollback（自動ロールバック復帰）**:
+  起動要求時に `ImagePullBackOff` や `CrashLoopBackOff` 等のコンテナ異常を検知した場合、Kubernetesが保持する過去のReplicaSet履歴（`revision`）を参照し、直前の正常稼働バージョンへ自律的にロールバックして無停止復帰を提供する機能。
+- **待合室UIのカスタマイズ**:
+  環境変数やConfigMap経由で任意のHTML/CSSテンプレートまたはタイトルを注入可能にする機能。
 
 ---
 
-## License
+## ドキュメント一覧
 
-MIT License. See [LICENSE](LICENSE) for details.
+- [アーキテクチャ設計とベストプラクティス](docs/architecture-and-best-practices.md): モジュール分割、Clean Architectureの適用、Kubernetes SIGs公式の設計指針。
+- [ArgoCD ApplicationSet 連携ガイド](docs/argocd-integration.md): Pull Requestジェネレータを用いたプレビュー環境の完全自動化設定例。
+- [設計動機と背景（As-Is vs To-Be）](docs/concept.md): 手動CIパイプラインの限界と、自律Operatorによる計算資源保護の思想。
+
+---
+
+## ライセンス
+
+MIT License。詳細は [LICENSE](LICENSE) を参照してください。

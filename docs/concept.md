@@ -1,14 +1,16 @@
-# Concept & Motivation: Why preview-operator?
+# 設計動機と背景：なぜ preview-operator を作るのか
 
-In Kubernetes-based development workflows, providing isolated, on-demand preview environments for every Pull Request is one of the most effective ways to accelerate code reviews. However, in resource-constrained environments (such as bare-metal clusters, homelabs, or cost-sensitive development clusters), running dozens of active preview deployments simultaneously causes severe CPU and memory contention.
+Kubernetes を活用した開発フローにおいて、Pull Request ごとに独立した検証用プレビュー環境を提供することは、レビューの摩擦を劇的に減らすベストプラクティスです。しかし、オンプレミス・おうちクラスタやコスト重視の開発環境において、複数のプレビュー環境を常時稼働させることは深刻な CPU・メモリ枯渇（OOMKill）を引き起こします。
+
+また、個人開発のWebサービスや検証環境においても、「月数回しかアクセスされないサービス」が常時リソースを占有し続ける課題があります。
 
 ---
 
-## Evolution: As-Is vs To-Be
+## 変遷：As-Is（従来型）vs To-Be（本オペレーター）
 
-### As-Is: CI-Driven Manual Pipelines (Heavy & Resource-Intensive)
+### 従来型（As-Is）：CI駆動の手動生成パイプライン
 
-In traditional setups, CI runs custom bash scripts or automation to generate manifests and deploy preview pods that run 24/7 until manually cleaned up.
+従来のCI中心の構成では、GitHub Actions 等が動的にマニフェストを生成し、GitリポジトリへコミットしてArgoCDに同期させる方式が一般的でした。
 
 ```mermaid
 %%{init: {"flowchart": {"curve": "basis"}}}%%
@@ -16,60 +18,61 @@ flowchart TD
     subgraph GitHub ["GitHub"]
         PR["Pull Request #123"]
         CI["GitHub Actions"]
-        GitRepo["Git Repository"]
+        GitRepo["Git リポジトリ"]
     end
 
-    subgraph Cluster ["Kubernetes Cluster"]
+    subgraph Cluster ["Kubernetes クラスタ"]
         ArgoCD["Argo CD"]
-        Pod["Preview Pod (24/7 Running / Memory Hog)"]
+        Pod["プレビュー用 Pod (常時稼働 / メモリ消費)"]
         Ingress["Ingress"]
     end
 
-    PR -->|"Trigger"| CI
-    CI -->|"Generate Manifests & Commit"| GitRepo
-    GitRepo -->|"Sync"| ArgoCD
-    ArgoCD -->|"Deploy"| Pod
-    Ingress -->|"Direct Routing"| Pod
+    PR -->|"イベント発火"| CI
+    CI -->|"マニフェスト動的生成 & commit"| GitRepo
+    GitRepo -->|"Git同期"| ArgoCD
+    ArgoCD -->|"デプロイ"| Pod
+    Ingress -->|"常時ルーティング"| Pod
 
     style GitRepo fill:#ffe6e6,stroke:#ff4d4d
     style Pod fill:#ffe6e6,stroke:#ff4d4d
 ```
 
-**Pain Points:**
-- **Resource Exhaustion**: Pods run continuously even when reviewers are away or sleeping.
-- **Git Repo Pollution**: Generating dynamic manifests directly in Git repos clutters commit history.
-- **Cost**: Unnecessary cloud compute bills or OOMKills in local bare-metal clusters.
+**課題と摩擦:**
+- **リソースの枯渇**: レビューが行われていない深夜や週末もPodが動き続け、メモリを占有する。
+- **Git履歴の汚染**: 自動生成マニフェストのコミットがGitログを埋め尽くす。
+- **コストと運用負荷**: クラウド費用の増大や、ローカルクラスタでのリソース制限。
 
 ---
 
-### To-Be: Operator-Driven Scale-to-Zero & Instant Wakeup
+### 本オペレーター（To-Be）：自律型 Scale-to-Zero & 待合室即時復帰
 
-With `preview-operator`, preview pods consume cluster resources **only when being actively viewed**.
+`preview-operator` を導入することで、Pod は「実際にアクセスされている時間だけ」クラスタリソースを消費します。
 
 ```mermaid
 %%{init: {"flowchart": {"curve": "basis"}}}%%
 flowchart TD
-    subgraph Reviewer ["Reviewer"]
-        Browser["Web Browser"]
+    subgraph Reviewer ["ユーザー / レビューワー"]
+        Browser["Webブラウザ"]
     end
 
-    subgraph Cluster ["Kubernetes Cluster"]
+    subgraph Cluster ["Kubernetes クラスタ"]
         Ingress["Ingress"]
-        Operator["preview-operator (Waiting Room Proxy + Sleeper)"]
-        Pod["Preview Pod (Replicas: 0 or 1)"]
+        Operator["preview-operator (待合室プロキシ + アイドル監視)"]
+        Pod["対象 Pod (Replicas: 0 または 1)"]
     end
 
-    Browser -->|"HTTP Request"| Ingress
-    Ingress -->|"Forward"| Operator
-    Operator -->|"Pod stopped? Scale 0 -> 1 & Show Waiting Room"| Pod
-    Operator -->|"Pod ready? Reverse proxy traffic"| Pod
-    Operator -->|"Idle for N minutes? Scale 1 -> 0"| Pod
+    Browser -->|"HTTPリクエスト"| Ingress
+    Ingress -->|"リクエスト中継"| Operator
+    Operator -->|"Pod停止中: 0 -> 1 にスケール要求 & 待合室HTML返却"| Pod
+    Operator -->|"Pod準備完了: 透過プロキシ"| Pod
+    Operator -->|"一定時間無アクセス: 1 -> 0 にスリープ"| Pod
 
     style Operator fill:#e6ffe6,stroke:#33cc33
     style Pod fill:#fff2e6,stroke:#ff9933
 ```
 
-**Key Advantages:**
-1. **Zero Footprint When Idle**: Scales deployments to 0 replicas after an idle period.
-2. **Transparent User Experience**: Reviewers see a fast, auto-refreshing "Waking up preview..." page rather than a 502/503 Bad Gateway error.
-3. **No Complex Infrastructure**: No Service Mesh (Istio/Linkerd) or Knative required. Just a single Go container deployed alongside your app.
+**本設計のメリット:**
+1. **待機時リソースゼロ**: アイドル期間中は `replicas=0` となり、CPU・メモリ消費がゼロになります。
+2. **502/503エラーのないUX**: コールドスタート時もBad Gatewayエラーを返さず、自動リロード付きの待合室画面でスムーズに起動を待たせます。
+3. **インフラの単純性**: KnativeやIstio等の大規模なサービスメッシュを導入することなく、軽量コンテナ1つを配置するだけで機能します。
+4. **個人開発サービスへの応用**: PRプレビュー環境だけでなく、アクセス頻度の低い個人開発の本番Webサービスのリソース節約にも活用可能です。

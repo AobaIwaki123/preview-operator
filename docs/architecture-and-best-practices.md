@@ -45,3 +45,21 @@ Kubernetesのカスタムコントローラー開発には大きく分けて2つ
   マニフェスト定義、リソースリクエスト/リミット、シグナル処理に関する公式ガイドライン。
 - **[Production Best Practices Checklist](https://learnk8s.io/production-best-practices)** (Learnk8s):
   本番環境における可用性、セキュリティ、オブザーバビリティのアンチパターン防止チェックリスト。
+
+---
+
+## 4. 自律回復アーキテクチャの展望：Self-Healing Rollback
+
+### 背景と課題
+Scale-to-Zero 環境では、コールドスタート時に `replicas=0 -> 1` へスケールアップした際、新しいイメージに異常（`ImagePullBackOff`、`CrashLoopBackOff`、設定ミス等）があると、Podが停止したまま待合室プロキシがタイムアウトする課題が生じます。
+通常のKubernetesローリングアップデートでは「新PodがReadyになるまで旧Podを維持する」ことで無停止を担保しますが、すでにPodが0台の場合はその恩恵を受けられません。
+
+### 解決アプローチ：ReplicaSet履歴の活用
+Kubernetes の Deployment は、過去のデプロイ履歴を `ReplicaSet`（デフォルト10世代）として保持し、各世代の `spec.template` が不変（イミュータブル）に保存されています。
+
+1. **異常検知**: Operator がスケールアップ後、一定時間（例: 30秒）経過しても Pod が Ready にならず、エラー状態（`ImagePullBackOff` / `CrashLoopBackOff`）であることを検知。
+2. **履歴探索**: `client-go` の `apps/v1.ReplicaSets` API を用い、直前の正常稼働リビジョン（`deployment.kubernetes.io/revision`）を取得。
+3. **自律ロールバック**: 取得した過去の `PodTemplateSpec` で Deployment の `spec.template` を自動パッチ（`kubectl rollout undo` 相当の操作を自律実行）。
+4. **無停止復帰**: 安定版Podが立ち上がり、ユーザーやレビューワーに対してサービス停止を回避する。
+
+この仕組みにより、外部ツールや人間の手動介入なしに「コールドスタート障害からの自律回復」が実現します。
