@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preview-operator
+  namespace: preview-sample
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: preview-operator-role
+  namespace: preview-sample
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: preview-operator-rb
+  namespace: preview-sample
+subjects:
+  - kind: ServiceAccount
+    name: preview-operator
+    namespace: preview-sample
+roleRef:
+  kind: Role
+  name: preview-operator-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: preview-operator
+  namespace: preview-sample
+  labels:
+    app: preview-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: preview-operator
+  template:
+    metadata:
+      labels:
+        app: preview-operator
+    spec:
+      serviceAccountName: preview-operator
+      containers:
+        - name: operator
+          image: ghcr.io/aobaiwaki123/preview-operator:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: TARGET_URL
+              value: "http://sample-app.preview-sample.svc.cluster.local:8080"
+            - name: TARGET_NS
+              value: "preview-sample"
+            - name: TARGET_DEPLOY
+              value: "sample-app"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: preview-operator
+  namespace: preview-sample
+spec:
+  selector:
+    app: preview-operator
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+# Ingress を preview-operator（受付係）に向ける
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sample-app
+  namespace: preview-sample
+spec:
+  ingressClassName: cloudflare-tunnel
+  rules:
+    - host: sample-preview.aooba.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: preview-operator
+                port:
+                  number: 8080
