@@ -25,6 +25,30 @@ func NewScaler(client *kubernetes.Clientset, namespace, deploy string) *Scaler {
 	}
 }
 
+// DeploymentStatus represents the current scaling and ready status.
+type DeploymentStatus struct {
+	DesiredReplicas int32
+	ReadyReplicas   int32
+}
+
+// GetStatus returns the desired and ready replicas of the target deployment.
+func (s *Scaler) GetStatus(ctx context.Context) (*DeploymentStatus, error) {
+	deploy, err := s.client.AppsV1().Deployments(s.namespace).Get(ctx, s.deploy, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get deployment %s/%s: %w", s.namespace, s.deploy, err)
+	}
+
+	desired := int32(1)
+	if deploy.Spec.Replicas != nil {
+		desired = *deploy.Spec.Replicas
+	}
+
+	return &DeploymentStatus{
+		DesiredReplicas: desired,
+		ReadyReplicas:   deploy.Status.ReadyReplicas,
+	}, nil
+}
+
 // GetReplicas returns the current replica count of the target deployment.
 func (s *Scaler) GetReplicas(ctx context.Context) (int32, error) {
 	scale, err := s.client.AppsV1().Deployments(s.namespace).GetScale(ctx, s.deploy, metav1.GetOptions{})
