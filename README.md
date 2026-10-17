@@ -1,172 +1,157 @@
 # preview-operator
 
-おうちKubernetesにおけるPull Requestプレビュー環境の自律ライフサイクル（ArgoCD ApplicationSet）およびアイドル時自動スリープ（Scale to Zero）を提供する軽量コントローラー。
+> **Ultra-lightweight Kubernetes controller providing on-demand wakeup proxies and automated scale-to-zero for Pull Request preview environments.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](go.mod)
+
+`preview-operator` solves the resource-exhaustion dilemma of ephemeral preview environments. Instead of letting idle preview pods consume valuable CPU and RAM 24/7, `preview-operator` puts them to sleep (`replicas=0`) and transparently revives them (`replicas=1`) with an instant loading screen upon incoming HTTP traffic.
 
 ---
 
-## Architecture: As-Is vs To-Be
+## Features
 
-### As-Is: CI駆動のGitOps（手動パイプライン）
+- ⚡ **Scale to Zero**: Automatically scales deployments to `replicas=0` after an inactivity timeout (e.g. `5m`, `30m`, `2h`).
+- 🚀 **Zero-Wait Wakeup Proxy**: Intercepts HTTP requests and serves an auto-refreshing "Waking up preview..." waiting room while scaling back up.
+- 🛡️ **Ultra-Lightweight**: Zero heavyweight dependencies. No Knative, Istio, or complex Service Meshes required. Single binary Alpine container (~15MB).
+- 🔌 **Plug & Play**: Works alongside your existing Ingress and Deployments with standard Kubernetes RBAC.
+- 🔄 **ArgoCD ApplicationSet Compatible**: Pairs seamlessly with ArgoCD Pull Request generators.
+
+---
+
+## How It Works
 
 ```mermaid
 %%{init: {"flowchart": {"curve": "basis"}}}%%
-flowchart TD
-    subgraph GitHub ["GitHub"]
-        PR["Pull Request #123"]
-        CI["GitHub Actions"]
-        GitRepo["Git Repository"]
-    end
-
-    subgraph Registry ["Container Registry"]
-        Harbor["Harbor (自前運用)"]
-    end
-
-    subgraph Cluster ["k0s Cluster"]
-        ArgoCD["Argo CD (Git同期)"]
-        Pod["Preview Pod (常時稼働 / メモリ消費)"]
-        Ingress["Cloudflare Ingress"]
-    end
-
-    PR -->|"イベント発火"| CI
-    CI -->|"ビルド & Push"| Harbor
-    CI -->|"マニフェスト生成 & Git commit"| GitRepo
-    GitRepo -->|"マニフェスト検知"| ArgoCD
-    ArgoCD -->|"デプロイ"| Pod
-    Ingress -->|"常時ルーティング"| Pod
-
-    style GitRepo fill:#ffe6e6,stroke:#ff4d4d
-    style Pod fill:#ffe6e6,stroke:#ff4d4d
-    style Harbor fill:#ffe6e6,stroke:#ff4d4d
+flowchart LR
+    Browser["User / Reviewer"] -->|"1. HTTP Request"| Ingress["Ingress"]
+    Ingress -->|"2. Forward"| Proxy["preview-operator<br>(Wakeup Proxy)"]
+    
+    Proxy -->|"3. Replicas == 0?<br>Scale to 1"| K8sAPI["Kubernetes API"]
+    Proxy -.->|"4. Still starting?<br>Show Waiting Room"| Browser
+    
+    Proxy -->|"5. Ready?<br>Reverse Proxy"| AppPod["Preview Pod<br>(Deployment)"]
+    
+    Sleeper["preview-operator<br>(Idle Sleeper)"] -->|"6. Idle > 5m?<br>Scale to 0"| K8sAPI
 ```
+
+1. **When Idle**: Deployment is scaled to `replicas=0`. Cluster resources are fully conserved.
+2. **On First Visit**: `preview-operator` intercepts traffic, issues `replicas=1` via `client-go`, and renders a responsive waiting room UI.
+3. **When Pod is Ready**: The browser automatically refreshes and traffic is transparently reverse-proxied to the backend.
+4. **On Inactivity**: A background goroutine checks the last request timestamp and scales the deployment back to `0`.
 
 ---
 
-### To-Be: CRD / Operator駆動（自律ライフサイクル & Scale to Zero）
+## Quickstart
 
-```mermaid
-%%{init: {"flowchart": {"curve": "basis"}}}%%
-flowchart TD
-    subgraph GitHub ["GitHub"]
-        PR["Pull Request #123"]
-        CI["GitHub Actions"]
-    end
+### 1. Configuration (Environment Variables)
 
-    subgraph Registry ["Container Registry"]
-        GHCR["GHCR (GitHub Packages / 容量無制限)"]
-    end
+| Variable | Description | Default | Required |
+|---|---|---|---|
+| `TARGET_SERVICE_URL` | Upstream backend URL to reverse proxy to (e.g. `http://my-app:80`) | - | Yes |
+| `DEPLOYMENT_NAME` | Target Kubernetes Deployment name to scale | - | Yes |
+| `NAMESPACE` | Target Kubernetes Namespace | `default` | No |
+| `IDLE_TIMEOUT` | Idle duration before sleeping (e.g. `5m`, `30m`, `2h`) | `2h` | No |
+| `PORT` | Listening port for the operator proxy | `8080` | No |
 
-    subgraph Cluster ["k0s Cluster"]
-        subgraph ExistingOperator ["既存Operator: Argo CD"]
-            AppSet["ApplicationSet (PR Generator)"]
-        end
+### 2. Kubernetes Deployment Example
 
-        subgraph CustomOperator ["自作Operator: preview-operator"]
-            Proxy["Wakeup Proxy (待合室プロキシ)"]
-            Sleeper["Sleeper Controller (アイドル検知)"]
-        end
-
-        Pod["Preview Pod (オンデマンド稼働)"]
-        Ingress["Cloudflare Ingress"]
-    end
-
-    subgraph User ["Reviewer"]
-        Browser["ブラウザ"]
-    end
-
-    %% ライフサイクル制御
-    PR -->|"ビルド指示のみ"| CI
-    CI -->|"ビルド & Push"| GHCR
-    PR -.->|"PR一覧を直接ポーリング"| AppSet
-    AppSet -->|"PR作成時: 自動デプロイ / PR閉鎖時: 自動消去"| Pod
-
-    %% トラフィック & Scale-to-Zero制御
-    Browser -->|"URLアクセス"| Ingress
-    Ingress -->|"リクエスト"| Proxy
-    Proxy -->|"未起動時: Replicas 0 -> 1 に即時復帰"| Pod
-    Proxy -->|"起動済み: トラフィック転送"| Pod
-    Sleeper -->|"2時間アクセスなし検知: Replicas 1 -> 0"| Pod
-
-    style AppSet fill:#e6f2ff,stroke:#3399ff
-    style Proxy fill:#e6ffe6,stroke:#33cc33
-    style Sleeper fill:#e6ffe6,stroke:#33cc33
-    style GHCR fill:#e6f2ff,stroke:#3399ff
-    style Pod fill:#fff2e6,stroke:#ff9933
-```
-
----
-
-## ArgoCD ApplicationSet Definition (PR Generator)
+Deploy `preview-operator` in the target namespace and route your Ingress to `service/preview-operator:8080`:
 
 ```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: ApplicationSet
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: preview-environments
-  namespace: argocd
+  name: preview-operator
+  namespace: preview-app
 spec:
-  generators:
-    - pullRequest:
-        github:
-          owner: AobaIwaki123
-          repo: my-app
-          tokenRef:
-            secretName: github-token
-            key: token
+  replicas: 1
+  selector:
+    matchLabels:
+      app: preview-operator
   template:
     metadata:
-      name: 'preview-pr-{{number}}'
+      labels:
+        app: preview-operator
     spec:
-      project: default
-      source:
-        repoURL: 'https://github.com/AobaIwaki123/my-app'
-        targetRevision: '{{head_sha}}'
-        path: k8s/preview
-        helm:
-          parameters:
-            - name: image.tag
-              value: '{{head_sha}}'
-            - name: ingress.host
-              value: 'pr-{{number}}.preview.example.com'
-      destination:
-        server: https://kubernetes.default.svc
-        namespace: 'pr-{{number}}'
-      syncPolicy:
-        automated:
-          prune: true
-          selfHeal: true
+      serviceAccountName: preview-operator-sa
+      containers:
+        - name: operator
+          image: ghcr.io/aobaiwaki123/preview-operator:latest
+          env:
+            - name: TARGET_SERVICE_URL
+              value: "http://my-app-service:80"
+            - name: DEPLOYMENT_NAME
+              value: "my-app"
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: IDLE_TIMEOUT
+              value: "10m"
+            - name: PORT
+              value: "8080"
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: preview-operator
+  namespace: preview-app
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: preview-operator
+```
+
+### 3. Required RBAC
+
+The operator requires permission to `get` and `update` (patch) `scale` subresources on the target Deployment:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preview-operator-sa
+  namespace: preview-app
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: preview-operator-role
+  namespace: preview-app
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "watch", "list", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: preview-operator-rb
+  namespace: preview-app
+subjects:
+  - kind: ServiceAccount
+    name: preview-operator-sa
+roleRef:
+  kind: Role
+  name: preview-operator-role
+  apiGroup: rbac.authorization.k8s.io
 ```
 
 ---
 
-## 自作Operator（preview-operator）の概要
+## Documentation
 
-Go言語で実装された、おうちKubernetesの計算資源を保護するための軽量コントローラー。
-
-### 1. Wakeup Proxy (待合室プロキシ)
-- Ingressからの初回リクエストを受け付ける超軽量リバースプロキシ（`net/http/httputil`）。
-- 対象PRのPodが停止している（`replicas=0`）場合、`client-go` を介して `replicas=1` へ即時スケールアップ。
-- 起動待機中はシンプルなローディングHTMLを返却し、PodのReady検知後に本来のアプリケーションへリダイレクト/透過転送。
-
-### 2. Sleeper Controller (アイドル検知)
-- プロキシが保持する各Preview環境の最終アクセス時刻（Last Accessed Timestamp）を監視。
-- 指定時間（デフォルト: 2時間）無アクセスの環境を検知し、`replicas=0` にスケールダウンしてメモリ・CPUを解放。
+- [Architecture & Controller Best Practices](docs/architecture-and-best-practices.md): Deep dive into modular design, Clean Architecture, and Kubernetes SIGs best practices.
+- [ArgoCD ApplicationSet Integration](docs/argocd-integration.md): Step-by-step recipe for automated PR lifecycle management.
+- [Concept & Motivation](docs/concept.md): Why we built this, and how it compares to traditional CI setups.
 
 ---
 
-## 開発ロードマップ (Roadmap)
+## License
 
-- [ ] **Phase 1: 検証用 Sample App の作成と k8s デプロイ**
-  - 軽量な検証用Webアプリ（Hello World / ステータス表示）の作成
-  - GitHub Actions で GHCR へイメージプッシュ
-  - 最小限の k8s マニフェスト（Deployment, Service, Ingress）をクラスタに手動デプロイして疎通確認
-- [ ] **Phase 2: ArgoCD ApplicationSet (PR Generator) の疎通**
-  - GitHub PRの作成をトリガーに、Sample Appが自動デプロイされることを確認
-  - PR Close時にNamespaceごと自動削除されることを確認
-- [ ] **Phase 3: Wakeup Proxy の実装（Go）**
-  - `replicas=0` の状態でアクセスした際、「起動中...」画面を返却しつつ `client-go` で `replicas=1` にスケールアップ
-  - Pod起動完了後に Sample App の画面へ透過転送/自動リダイレクト
-- [ ] **Phase 4: Sleeper Controller (アイドル検知) の実装**
-  - 最終アクセス時刻から一定時間（例: テスト時は2分、本番は2時間）経過で `replicas=0` へ自動スリープ
-- [ ] **Phase 5: 社内LTスライドへの反映 ＆ デモ**
-  - 実際のScale-to-Zeroと即時復帰の様子をスライド・デモとして組み込み、技術的エッジを披露
-
+MIT License. See [LICENSE](LICENSE) for details.
