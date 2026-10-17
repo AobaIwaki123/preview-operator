@@ -9,6 +9,11 @@
 ### As-Is: CI駆動のGitOps（手動パイプライン）
 
 ```mermaid
+---
+config:
+  flowchart:
+    curve: basis
+---
 flowchart TD
     subgraph GitHub ["GitHub"]
         PR["Pull Request #123"]
@@ -43,6 +48,11 @@ flowchart TD
 ### To-Be: CRD / Operator駆動（自律ライフサイクル & Scale to Zero）
 
 ```mermaid
+---
+config:
+  flowchart:
+    curve: basis
+---
 flowchart TD
     subgraph GitHub ["GitHub"]
         PR["Pull Request #123"]
